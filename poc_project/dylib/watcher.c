@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <string.h>
@@ -26,6 +27,7 @@ struct ProtectedPage {
     mach_vm_address_t start;
     mach_vm_size_t size;
     bool decrypted;
+    uint64_t last_touch_ns;
 };
 
 static struct ProtectedPage protected_pages[MAX_PROTECTED_PAGES];
@@ -36,6 +38,12 @@ static vm_prot_t text_max_prot = 0;
 static vm_prot_t text_init_prot = 0;
 static bool atexit_registered = false;
 static mach_vm_size_t page_size = 0;
+static mach_timebase_info_data_t timebase_info = {0};
+static pthread_mutex_t page_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile bool monitor_running = false;
+static pthread_t monitor_thread;
+static bool monitor_thread_started = false;
+static const uint64_t inactivity_ns = 500000000ULL;
 
 #ifndef MAP_JIT
 #define MAP_JIT 0
@@ -107,6 +115,70 @@ static inline mach_vm_size_t aligned_range_size(mach_vm_address_t addr, mach_vm_
     return end - start;
 }
 
+static inline uint64_t monotonic_ns(void) {
+    uint64_t now = mach_absolute_time();
+    if (timebase_info.denom == 0) {
+        return now;
+    }
+    return (now * timebase_info.numer) / timebase_info.denom;
+}
+
+static bool reencrypt_page_locked(size_t page_index) {
+    if (page_index >= protected_page_count) {
+        return false;
+    }
+    if (!protected_pages[page_index].decrypted) {
+        return true;
+    }
+
+    if (!apply_protection(page_index, VM_PROT_READ | VM_PROT_WRITE)) {
+        log_line("Failed to grant write access during re-encryption.");
+        return false;
+    }
+
+#if defined(__APPLE__) && defined(__arm64__)
+    pthread_jit_write_protect_np(0);
+#endif
+    xor_page_contents(page_index);
+#if defined(__APPLE__) && defined(__arm64__)
+    pthread_jit_write_protect_np(1);
+#endif
+
+    if (!apply_protection(page_index, VM_PROT_NONE)) {
+        log_line("Failed to reset PROT_NONE during re-encryption.");
+        return false;
+    }
+
+    protected_pages[page_index].decrypted = false;
+    protected_pages[page_index].last_touch_ns = 0;
+    log_value("Page re-encrypted", protected_pages[page_index].start);
+    return true;
+}
+
+static void *page_monitor(void *arg) {
+    (void)arg;
+    while (monitor_running) {
+        usleep(100000);
+
+        uint64_t now_ns = monotonic_ns();
+        pthread_mutex_lock(&page_lock);
+        for (size_t i = 0; i < protected_page_count; ++i) {
+            struct ProtectedPage *page = &protected_pages[i];
+            if (!page->decrypted || page->last_touch_ns == 0) {
+                continue;
+            }
+            if (now_ns > page->last_touch_ns && (now_ns - page->last_touch_ns) > inactivity_ns) {
+                log_value("Idle page re-encrypt", page->start);
+                if (!reencrypt_page_locked(i)) {
+                    log_line("Background re-encryption failed.");
+                }
+            }
+        }
+        pthread_mutex_unlock(&page_lock);
+    }
+    return NULL;
+}
+
 static void xor_crypt(void *addr, size_t size, uint8_t key) {
     uint8_t *data = (uint8_t *)addr;
     for (size_t i = 0; i < size; i++) {
@@ -158,6 +230,7 @@ static int locate_text_section(void) {
                         protected_pages[protected_page_count].start = region_start;
                         protected_pages[protected_page_count].size = next - region_start;
                         protected_pages[protected_page_count].decrypted = false;
+                        protected_pages[protected_page_count].last_touch_ns = 0;
                         protected_page_count++;
                         region_start = next;
                     }
@@ -196,8 +269,13 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
     }
 
     if (page_index != SIZE_MAX) {
-        if (protected_pages[page_index].decrypted) {
-            log_line("Page already decrypted; restoring RX and continuing.");
+        bool register_exit = false;
+
+        pthread_mutex_lock(&page_lock);
+        struct ProtectedPage *page = &protected_pages[page_index];
+        if (page->decrypted) {
+            page->last_touch_ns = monotonic_ns();
+            pthread_mutex_unlock(&page_lock);
             if (!apply_protection(page_index, text_init_prot)) {
                 log_line("Failed to restore RX protections.");
                 exit(1);
@@ -206,6 +284,7 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
         }
 
         if (!apply_protection(page_index, VM_PROT_READ | VM_PROT_WRITE)) {
+            pthread_mutex_unlock(&page_lock);
             log_line("Failed to grant write access.");
             exit(1);
         }
@@ -213,7 +292,7 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
 #if defined(__APPLE__) && defined(__arm64__)
         pthread_jit_write_protect_np(0);
 #endif
-        printf("Decrypting page at %p\n", (void *)protected_pages[page_index].start);
+        printf("Decrypting page at %p\n", (void *)page->start);
         log_line("Decrypting protected region.");
         xor_page_contents(page_index);
 
@@ -221,6 +300,7 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
         pthread_jit_write_protect_np(1);
 #endif
         if (!apply_protection(page_index, text_init_prot)) {
+            pthread_mutex_unlock(&page_lock);
             log_line("Failed to restore RX protections.");
             exit(1);
         }
@@ -228,10 +308,17 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
         printf("Page decrypted and executable.\n");
         log_line("Region set to RX.");
 
-        protected_pages[page_index].decrypted = true;
+        page->decrypted = true;
+        page->last_touch_ns = monotonic_ns();
         if (!atexit_registered) {
-            atexit(reencrypt_at_exit);
             atexit_registered = true;
+            register_exit = true;
+        }
+        pthread_mutex_unlock(&page_lock);
+        if (register_exit) {
+            if (atexit(reencrypt_at_exit) != 0) {
+                log_line("Failed to register atexit handler.");
+            }
         }
         return;
     }
@@ -243,30 +330,19 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
 
 static void reencrypt_at_exit(void) {
     log_line("Process exiting; re-encrypting protected pages.");
+    if (monitor_thread_started) {
+        monitor_running = false;
+        pthread_join(monitor_thread, NULL);
+        monitor_thread_started = false;
+    }
+
+    pthread_mutex_lock(&page_lock);
     for (size_t i = 0; i < protected_page_count; ++i) {
-        if (!protected_pages[i].decrypted) {
-            continue;
-        }
-
-        if (!apply_protection(i, VM_PROT_READ | VM_PROT_WRITE)) {
-            log_line("Failed to grant write access for exit re-encryption.");
-            continue;
-        }
-
-#if defined(__APPLE__) && defined(__arm64__)
-        pthread_jit_write_protect_np(0);
-#endif
-        xor_page_contents(i);
-#if defined(__APPLE__) && defined(__arm64__)
-        pthread_jit_write_protect_np(1);
-#endif
-
-        if (!apply_protection(i, VM_PROT_NONE)) {
-            log_line("Failed to reset PROT_NONE during exit re-encryption.");
-        } else {
-            log_value("Page re-encrypted", protected_pages[i].start);
+        if (!reencrypt_page_locked(i)) {
+            log_line("Re-encryption during exit encountered an error.");
         }
     }
+    pthread_mutex_unlock(&page_lock);
 }
 
 __attribute__((constructor))
@@ -283,6 +359,10 @@ static void init_watcher(void) {
         }
         log_value("Detected page size", page_size);
     }
+    if (timebase_info.denom == 0) {
+        mach_timebase_info(&timebase_info);
+    }
+
     for (uint32_t i = 0; i < image_count; i++) {
         const struct mach_header *header = _dyld_get_image_header(i);
         if (!header) {
@@ -338,4 +418,12 @@ static void init_watcher(void) {
     }
 
     log_value("Protected pages armed", protected_page_count);
+
+    monitor_running = true;
+    if (pthread_create(&monitor_thread, NULL, page_monitor, NULL) != 0) {
+        log_line("Failed to start page monitor thread.");
+        monitor_running = false;
+    } else {
+        monitor_thread_started = true;
+    }
 }

@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 #define PAYLOAD_SIZE 512
 
@@ -65,35 +68,63 @@ __attribute__((noinline)) static void secret_report(const char *payload, uint32_
     printf("================================\n");
 }
 
+static void reset_payload_state(char *payload, size_t len, uint32_t *checksum, uint32_t iteration)
+{
+    memset(payload, 0, len);
+    snprintf(payload, len,
+             "Top secret message #%u: Only visible with live decryption! [size=%zu]",
+             iteration, len);
+    *checksum = 0x1234ABCDu ^ iteration;
+    printf("\n[driver] Payload reset for iteration %u\n", iteration);
+}
+
 int main(void)
 {
     printf("Parent process started. Preparing payload...\n");
 
+    srand((unsigned)time(NULL));
+
     char payload[PAYLOAD_SIZE];
-    memset(payload, 0, sizeof(payload));
-    snprintf(payload, sizeof(payload),
-             "Top secret message: Only visible with live decryption! [%u]",
-             PAYLOAD_SIZE);
+    uint32_t checksum = 0;
+    uint32_t iteration = 0;
 
-    uint32_t checksum = 0x1234ABCDu;
+    typedef void (*stage_fn)(char *, size_t, uint32_t *);
+    typedef void (*filler_fn)(void);
 
-    stage_1(payload, sizeof(payload), &checksum);
-    filler_1();
-    stage_2(payload, sizeof(payload), &checksum);
-    stage_3(payload, sizeof(payload), &checksum);
-    filler_2();
-    stage_4(payload, sizeof(payload), &checksum);
-    stage_5(payload, sizeof(payload), &checksum);
-    filler_3();
-    stage_6(payload, sizeof(payload), &checksum);
-    stage_7(payload, sizeof(payload), &checksum);
-    filler_4();
-    stage_8(payload, sizeof(payload), &checksum);
-    stage_9(payload, sizeof(payload), &checksum);
-    stage_10(payload, sizeof(payload), &checksum);
+    stage_fn stages[] = {
+        stage_1, stage_2, stage_3, stage_4, stage_5,
+        stage_6, stage_7, stage_8, stage_9, stage_10};
+    const size_t stage_count = sizeof(stages) / sizeof(stages[0]);
 
-    secret_report(payload, checksum);
+    filler_fn fillers[] = {filler_1, filler_2, filler_3, filler_4};
+    const size_t filler_count = sizeof(fillers) / sizeof(fillers[0]);
 
-    printf("Parent process exiting.\n");
-    return (int)checksum;
+    reset_payload_state(payload, sizeof(payload), &checksum, iteration);
+
+    while (1) {
+        ++iteration;
+
+        int action = rand() % (stage_count + (int)filler_count + 2);
+
+        if (action < (int)stage_count) {
+            printf("[driver] Iteration %u -> stage %d\n", iteration, action + 1);
+            stages[action](payload, sizeof(payload), &checksum);
+        } else if (action < (int)(stage_count + filler_count)) {
+            size_t idx = (size_t)(action - (int)stage_count);
+            printf("[driver] Iteration %u -> filler %zu\n", iteration, idx + 1);
+            fillers[idx]();
+        } else {
+            printf("[driver] Iteration %u -> report snapshot\n", iteration);
+            secret_report(payload, checksum);
+        }
+
+        if (iteration % 16 == 0) {
+            reset_payload_state(payload, sizeof(payload), &checksum, iteration / 16);
+        }
+
+        fflush(stdout);
+        sleep(2);
+    }
+
+    return 0;
 }
