@@ -12,8 +12,6 @@
 #include <mach/mach_error.h>
 #include <pthread.h>
 
-#undef PAGE_SIZE
-#define PAGE_SIZE 0x1000
 #define XOR_KEY 0x55
 
 static const struct mach_header_64 *target_header = NULL;
@@ -21,12 +19,23 @@ static uint32_t target_image_index = 0;
 static mach_vm_address_t image_slide = 0;
 static mach_vm_address_t text_runtime_start = 0;
 static mach_vm_size_t text_runtime_size = 0;
+
+#define MAX_PROTECTED_PAGES 128
+
+struct ProtectedPage {
+    mach_vm_address_t start;
+    mach_vm_size_t size;
+    bool decrypted;
+};
+
+static struct ProtectedPage protected_pages[MAX_PROTECTED_PAGES];
+static size_t protected_page_count = 0;
 static mach_vm_address_t text_page_start = 0;
 static mach_vm_size_t text_protect_size = 0;
 static vm_prot_t text_max_prot = 0;
 static vm_prot_t text_init_prot = 0;
-static bool page_decrypted = false;
 static bool atexit_registered = false;
+static mach_vm_size_t page_size = 0;
 
 #ifndef MAP_JIT
 #define MAP_JIT 0
@@ -44,7 +53,13 @@ static void log_kern_error(const char *label, kern_return_t kr) {
     printf("[watcher] %s (kr=0x%x: %s)\n", label, kr, mach_error_string(kr));
 }
 
-static bool apply_protection(vm_prot_t prot) {
+static bool apply_protection(size_t page_index, vm_prot_t prot) {
+    if (page_index >= protected_page_count) {
+        return false;
+    }
+
+    mach_vm_address_t page_start = protected_pages[page_index].start;
+    mach_vm_size_t page_size = protected_pages[page_index].size;
     vm_prot_t request = prot;
     if (prot != VM_PROT_NONE) {
         vm_prot_t allowed = text_max_prot;
@@ -54,7 +69,7 @@ static bool apply_protection(vm_prot_t prot) {
         }
     }
 
-    kern_return_t kr = mach_vm_protect(mach_task_self(), text_page_start, text_protect_size, false, request);
+    kern_return_t kr = mach_vm_protect(mach_task_self(), page_start, page_size, false, request);
     if (kr != KERN_SUCCESS) {
         log_kern_error("mach_vm_protect failed to update protections", kr);
         return false;
@@ -62,13 +77,33 @@ static bool apply_protection(vm_prot_t prot) {
     return true;
 }
 
+static void xor_page_contents(size_t page_index) {
+    mach_vm_address_t page_start = protected_pages[page_index].start;
+    mach_vm_address_t page_end = page_start + protected_pages[page_index].size;
+    mach_vm_address_t content_start = page_start < text_runtime_start ? text_runtime_start : page_start;
+    mach_vm_address_t content_end = page_end;
+    mach_vm_address_t text_end = text_runtime_start + text_runtime_size;
+    if (content_end > text_end) {
+        content_end = text_end;
+    }
+    if (content_end <= content_start) {
+        return;
+    }
+    size_t span = (size_t)(content_end - content_start);
+    uint8_t *ptr = (uint8_t *)content_start;
+    for (size_t i = 0; i < span; ++i) {
+        ptr[i] ^= XOR_KEY;
+    }
+    __builtin___clear_cache((char *)content_start, (char *)(content_start + span));
+}
+
 static inline mach_vm_address_t page_align_down(mach_vm_address_t addr) {
-    return addr & ~(PAGE_SIZE - 1);
+    return addr & ~(page_size - 1);
 }
 
 static inline mach_vm_size_t aligned_range_size(mach_vm_address_t addr, mach_vm_size_t size) {
     mach_vm_address_t start = page_align_down(addr);
-    mach_vm_address_t end = (addr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    mach_vm_address_t end = (addr + size + page_size - 1) & ~(page_size - 1);
     return end - start;
 }
 
@@ -107,6 +142,26 @@ static int locate_text_section(void) {
                     if ((text_max_prot & VM_PROT_WRITE) == 0) {
                         log_line("Warning: __TEXT segment maxprot lacks write permission; decryption will fail.");
                     }
+
+                    mach_vm_address_t region_start = text_page_start;
+                    mach_vm_address_t region_end = text_page_start + text_protect_size;
+                    protected_page_count = 0;
+                    while (region_start < region_end) {
+                        if (protected_page_count >= MAX_PROTECTED_PAGES) {
+                            log_line("Too many pages to protect; truncating.");
+                            break;
+                        }
+                        mach_vm_address_t next = region_start + page_size;
+                        if (next > region_end) {
+                            next = region_end;
+                        }
+                        protected_pages[protected_page_count].start = region_start;
+                        protected_pages[protected_page_count].size = next - region_start;
+                        protected_pages[protected_page_count].decrypted = false;
+                        protected_page_count++;
+                        region_start = next;
+                    }
+
                     return 0;
                 }
             }
@@ -125,23 +180,32 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
     printf("SIGSEGV at address: %p\n", info->si_addr);
     log_value("Fault address", fault_addr);
 
-    if (text_protect_size == 0) {
+    if (protected_page_count == 0) {
         log_line("Protected region not initialized; aborting.");
         exit(1);
     }
 
-    mach_vm_address_t page_end = text_page_start + text_protect_size;
-    if (fault_addr >= text_page_start && fault_addr < page_end) {
-        if (page_decrypted) {
+    size_t page_index = SIZE_MAX;
+    for (size_t i = 0; i < protected_page_count; ++i) {
+        mach_vm_address_t start = protected_pages[i].start;
+        mach_vm_address_t end = start + protected_pages[i].size;
+        if (fault_addr >= start && fault_addr < end) {
+            page_index = i;
+            break;
+        }
+    }
+
+    if (page_index != SIZE_MAX) {
+        if (protected_pages[page_index].decrypted) {
             log_line("Page already decrypted; restoring RX and continuing.");
-            if (!apply_protection(text_init_prot)) {
+            if (!apply_protection(page_index, text_init_prot)) {
                 log_line("Failed to restore RX protections.");
                 exit(1);
             }
             return;
         }
 
-        if (!apply_protection(VM_PROT_READ | VM_PROT_WRITE)) {
+        if (!apply_protection(page_index, VM_PROT_READ | VM_PROT_WRITE)) {
             log_line("Failed to grant write access.");
             exit(1);
         }
@@ -149,15 +213,14 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
 #if defined(__APPLE__) && defined(__arm64__)
         pthread_jit_write_protect_np(0);
 #endif
-        printf("Decrypting page at %p\n", (void *)text_page_start);
+        printf("Decrypting page at %p\n", (void *)protected_pages[page_index].start);
         log_line("Decrypting protected region.");
-        xor_crypt((void *)text_runtime_start, text_runtime_size, XOR_KEY);
-        __builtin___clear_cache((char *)text_runtime_start, (char *)(text_runtime_start + text_runtime_size));
+        xor_page_contents(page_index);
 
 #if defined(__APPLE__) && defined(__arm64__)
         pthread_jit_write_protect_np(1);
 #endif
-        if (!apply_protection(text_init_prot)) {
+        if (!apply_protection(page_index, text_init_prot)) {
             log_line("Failed to restore RX protections.");
             exit(1);
         }
@@ -165,7 +228,7 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
         printf("Page decrypted and executable.\n");
         log_line("Region set to RX.");
 
-        page_decrypted = true;
+        protected_pages[page_index].decrypted = true;
         if (!atexit_registered) {
             atexit(reencrypt_at_exit);
             atexit_registered = true;
@@ -179,35 +242,47 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
 }
 
 static void reencrypt_at_exit(void) {
-    if (!page_decrypted) {
-        return;
-    }
+    log_line("Process exiting; re-encrypting protected pages.");
+    for (size_t i = 0; i < protected_page_count; ++i) {
+        if (!protected_pages[i].decrypted) {
+            continue;
+        }
 
-    log_line("Process exiting; re-encrypting protected region.");
-    if (!apply_protection(VM_PROT_READ | VM_PROT_WRITE)) {
-        log_line("Failed to grant write access for exit re-encryption.");
-        return;
-    }
+        if (!apply_protection(i, VM_PROT_READ | VM_PROT_WRITE)) {
+            log_line("Failed to grant write access for exit re-encryption.");
+            continue;
+        }
 
 #if defined(__APPLE__) && defined(__arm64__)
-    pthread_jit_write_protect_np(0);
+        pthread_jit_write_protect_np(0);
 #endif
-    xor_crypt((void *)text_runtime_start, text_runtime_size, XOR_KEY);
-    __builtin___clear_cache((char *)text_runtime_start, (char *)(text_runtime_start + text_runtime_size));
+        xor_page_contents(i);
 #if defined(__APPLE__) && defined(__arm64__)
-    pthread_jit_write_protect_np(1);
+        pthread_jit_write_protect_np(1);
 #endif
 
-    if (!apply_protection(VM_PROT_NONE)) {
-        log_line("Failed to reset PROT_NONE during exit re-encryption.");
-    } else {
-        log_line("Protected region re-encrypted and reset to PROT_NONE.");
+        if (!apply_protection(i, VM_PROT_NONE)) {
+            log_line("Failed to reset PROT_NONE during exit re-encryption.");
+        } else {
+            log_value("Page re-encrypted", protected_pages[i].start);
+        }
     }
 }
 
 __attribute__((constructor))
 static void init_watcher(void) {
     uint32_t image_count = _dyld_image_count();
+    if (page_size == 0) {
+        vm_size_t host_page = 0;
+        kern_return_t kr = host_page_size(mach_host_self(), &host_page);
+        if (kr != KERN_SUCCESS || host_page == 0) {
+            log_kern_error("host_page_size failed", kr);
+            page_size = 0x4000;
+        } else {
+            page_size = (mach_vm_size_t)host_page;
+        }
+        log_value("Detected page size", page_size);
+    }
     for (uint32_t i = 0; i < image_count; i++) {
         const struct mach_header *header = _dyld_get_image_header(i);
         if (!header) {
@@ -255,10 +330,12 @@ static void init_watcher(void) {
         return;
     }
 
-    if (!apply_protection(VM_PROT_NONE)) {
-        log_line("Failed to arm protected region.");
-        return;
+    for (size_t i = 0; i < protected_page_count; ++i) {
+        if (!apply_protection(i, VM_PROT_NONE)) {
+            log_line("Failed to arm protected region.");
+            return;
+        }
     }
 
-    log_line("Protected region armed.");
+    log_value("Protected pages armed", protected_page_count);
 }
