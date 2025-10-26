@@ -18,24 +18,39 @@
 static const struct mach_header_64 *target_header = NULL;
 static uint32_t target_image_index = 0;
 static mach_vm_address_t image_slide = 0;
-static mach_vm_address_t text_runtime_start = 0;
-static mach_vm_size_t text_runtime_size = 0;
 
-#define MAX_PROTECTED_PAGES 128
+#define MAX_PROTECTED_REGIONS 8
+#define MAX_PROTECTED_PAGES 256
+
+enum RegionKind {
+    REGION_KIND_TEXT = 0,
+    REGION_KIND_IMPORT = 1,
+};
+
+struct ProtectedRegion {
+    mach_vm_address_t runtime_start;
+    mach_vm_size_t runtime_size;
+    mach_vm_address_t page_start;
+    mach_vm_size_t protect_size;
+    vm_prot_t max_prot;
+    vm_prot_t init_prot;
+    char label[32];
+    enum RegionKind kind;
+    bool encrypted_ready;
+};
 
 struct ProtectedPage {
     mach_vm_address_t start;
     mach_vm_size_t size;
     bool decrypted;
     uint64_t last_touch_ns;
+    const struct ProtectedRegion *region;
 };
 
+static struct ProtectedRegion protected_regions[MAX_PROTECTED_REGIONS];
+static size_t protected_region_count = 0;
 static struct ProtectedPage protected_pages[MAX_PROTECTED_PAGES];
 static size_t protected_page_count = 0;
-static mach_vm_address_t text_page_start = 0;
-static mach_vm_size_t text_protect_size = 0;
-static vm_prot_t text_max_prot = 0;
-static vm_prot_t text_init_prot = 0;
 static bool atexit_registered = false;
 static mach_vm_size_t page_size = 0;
 static mach_timebase_info_data_t timebase_info = {0};
@@ -66,11 +81,17 @@ static bool apply_protection(size_t page_index, vm_prot_t prot) {
         return false;
     }
 
+    const struct ProtectedPage *page = &protected_pages[page_index];
+    const struct ProtectedRegion *region = page->region;
+    if (region == NULL) {
+        return false;
+    }
+
     mach_vm_address_t page_start = protected_pages[page_index].start;
     mach_vm_size_t page_size = protected_pages[page_index].size;
     vm_prot_t request = prot;
     if (prot != VM_PROT_NONE) {
-        vm_prot_t allowed = text_max_prot;
+        vm_prot_t allowed = region->max_prot;
         if ((prot & ~allowed) != 0) {
             log_line("Requested protection exceeds segment maxprot.");
             return false;
@@ -86,13 +107,20 @@ static bool apply_protection(size_t page_index, vm_prot_t prot) {
 }
 
 static void xor_page_contents(size_t page_index) {
-    mach_vm_address_t page_start = protected_pages[page_index].start;
-    mach_vm_address_t page_end = page_start + protected_pages[page_index].size;
-    mach_vm_address_t content_start = page_start < text_runtime_start ? text_runtime_start : page_start;
+    const struct ProtectedPage *page = &protected_pages[page_index];
+    const struct ProtectedRegion *region = page->region;
+    if (region == NULL) {
+        return;
+    }
+
+    mach_vm_address_t page_start = page->start;
+    mach_vm_address_t page_end = page_start + page->size;
+    mach_vm_address_t region_start = region->runtime_start;
+    mach_vm_address_t region_end = region_start + region->runtime_size;
+    mach_vm_address_t content_start = page_start < region_start ? region_start : page_start;
     mach_vm_address_t content_end = page_end;
-    mach_vm_address_t text_end = text_runtime_start + text_runtime_size;
-    if (content_end > text_end) {
-        content_end = text_end;
+    if (content_end > region_end) {
+        content_end = region_end;
     }
     if (content_end <= content_start) {
         return;
@@ -179,18 +207,150 @@ static void *page_monitor(void *arg) {
     return NULL;
 }
 
-static void xor_crypt(void *addr, size_t size, uint8_t key) {
-    uint8_t *data = (uint8_t *)addr;
-    for (size_t i = 0; i < size; i++) {
-        data[i] ^= key;
-    }
+static void reset_protection_state(void) {
+    protected_region_count = 0;
+    protected_page_count = 0;
+    memset(protected_regions, 0, sizeof(protected_regions));
+    memset(protected_pages, 0, sizeof(protected_pages));
 }
 
-static int locate_text_section(void) {
+static bool register_region(const char *segname, const char *sectname, const char *reason,
+                            enum RegionKind kind,
+                            mach_vm_address_t runtime_start, mach_vm_size_t runtime_size,
+                            vm_prot_t init_prot, vm_prot_t max_prot) {
+    if (runtime_size == 0) {
+        return true;
+    }
+
+    if (protected_region_count >= MAX_PROTECTED_REGIONS) {
+        log_line("Too many protected regions; skipping additional ones.");
+        return false;
+    }
+
+    struct ProtectedRegion *region = &protected_regions[protected_region_count++];
+    region->runtime_start = runtime_start;
+    region->runtime_size = runtime_size;
+    region->page_start = page_align_down(runtime_start);
+    region->protect_size = aligned_range_size(runtime_start, runtime_size);
+    region->init_prot = init_prot;
+    region->max_prot = max_prot;
+    snprintf(region->label, sizeof(region->label), "%s,%s", segname, sectname);
+    region->kind = kind;
+    region->encrypted_ready = (kind == REGION_KIND_TEXT);
+
+    printf("[watcher] Protecting %s (%s)\n", region->label, reason);
+    log_value("Region start", region->runtime_start);
+    log_value("Region span bytes", region->protect_size);
+    log_value("Region initprot", region->init_prot);
+    log_value("Region maxprot", region->max_prot);
+    if ((max_prot & VM_PROT_WRITE) == 0) {
+        log_line("Warning: segment maxprot lacks write permission; decryption will fail.");
+    }
+
+    mach_vm_address_t region_start = region->page_start;
+    mach_vm_address_t region_end = region->page_start + region->protect_size;
+    while (region_start < region_end) {
+        if (protected_page_count >= MAX_PROTECTED_PAGES) {
+            log_line("Too many pages to protect; truncating.");
+            return false;
+        }
+        mach_vm_address_t next = region_start + page_size;
+        if (next > region_end) {
+            next = region_end;
+        }
+        struct ProtectedPage *page = &protected_pages[protected_page_count++];
+        page->start = region_start;
+        page->size = next - region_start;
+        page->decrypted = false;
+        page->last_touch_ns = 0;
+        page->region = region;
+        region_start = next;
+    }
+
+    return true;
+}
+
+static bool prime_region_encryption(struct ProtectedRegion *region) {
+    if (region == NULL) {
+        return true;
+    }
+
+    if (region->kind == REGION_KIND_TEXT) {
+        region->encrypted_ready = true;
+        return true;
+    }
+
+    if (region->encrypted_ready) {
+        return true;
+    }
+
+    bool ok = true;
+    for (size_t i = 0; i < protected_page_count; ++i) {
+        if (protected_pages[i].region != region) {
+            continue;
+        }
+        if (!apply_protection(i, VM_PROT_READ | VM_PROT_WRITE)) {
+            log_line("Failed to grant write access during region priming.");
+            ok = false;
+            break;
+        }
+#if defined(__APPLE__) && defined(__arm64__)
+        pthread_jit_write_protect_np(0);
+#endif
+        xor_page_contents(i);
+#if defined(__APPLE__) && defined(__arm64__)
+        pthread_jit_write_protect_np(1);
+#endif
+        if (!apply_protection(i, region->init_prot)) {
+            log_line("Failed to restore protections after region priming.");
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok) {
+        region->encrypted_ready = true;
+        printf("[watcher] Region primed encrypted: %s\n", region->label);
+    }
+    return ok;
+}
+
+static bool should_protect_code_section(const char *segname, const char *sectname) {
+    if (strcmp(segname, "__TEXT") != 0) {
+        return false;
+    }
+    return strcmp(sectname, "__text") == 0 ||
+           strcmp(sectname, "__stubs") == 0 ||
+           strcmp(sectname, "__stub_helper") == 0 ||
+           strcmp(sectname, "__picsymbolstub4") == 0;
+}
+
+static int locate_protected_sections(void) {
     if (target_header == NULL) {
         log_line("Target Mach header not selected.");
         return -1;
     }
+
+    reset_protection_state();
+
+    struct {
+        mach_vm_address_t start;
+        mach_vm_address_t end;
+        vm_prot_t init_prot;
+        vm_prot_t max_prot;
+        bool valid;
+    } code_span = {0};
+
+#define MAX_IMPORT_SPANS 8
+    struct {
+        mach_vm_address_t start;
+        mach_vm_size_t size;
+        vm_prot_t init_prot;
+        vm_prot_t max_prot;
+        char segname[17];
+        char sectname[17];
+    } import_spans[MAX_IMPORT_SPANS];
+    size_t import_span_count = 0;
 
     const struct load_command *command = (const struct load_command *)((const uint8_t *)target_header + sizeof(*target_header));
     for (uint32_t i = 0; i < target_header->ncmds; i++) {
@@ -198,52 +358,82 @@ static int locate_text_section(void) {
             const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
             const struct section_64 *section = (const struct section_64 *)((const uint8_t *)segment + sizeof(*segment));
             for (uint32_t j = 0; j < segment->nsects; j++, section++) {
-                if (strcmp(section->segname, "__TEXT") == 0 && strcmp(section->sectname, "__text") == 0) {
-                    text_runtime_start = section->addr + image_slide;
-                    text_runtime_size = section->size;
-                    text_page_start = page_align_down(text_runtime_start);
-                    text_protect_size = aligned_range_size(text_runtime_start, text_runtime_size);
-                    text_max_prot = segment->maxprot;
-                    text_init_prot = segment->initprot;
-                    log_value("Text runtime start", text_runtime_start);
-                    log_value("Text size bytes", text_runtime_size);
-                    log_value("Text page start", text_page_start);
-                    log_value("Protected span bytes", text_protect_size);
-                    log_value("Segment maxprot", text_max_prot);
-                    log_value("Segment initprot", text_init_prot);
-                    if ((text_max_prot & VM_PROT_WRITE) == 0) {
-                        log_line("Warning: __TEXT segment maxprot lacks write permission; decryption will fail.");
-                    }
+                uint32_t section_type = section->flags & SECTION_TYPE;
+                bool is_text = should_protect_code_section(section->segname, section->sectname);
+                bool is_import = (section_type == S_NON_LAZY_SYMBOL_POINTERS) || (section_type == S_LAZY_SYMBOL_POINTERS);
+                if (!is_text && !is_import) {
+                    continue;
+                }
+                if (section->size == 0) {
+                    continue;
+                }
 
-                    mach_vm_address_t region_start = text_page_start;
-                    mach_vm_address_t region_end = text_page_start + text_protect_size;
-                    protected_page_count = 0;
-                    while (region_start < region_end) {
-                        if (protected_page_count >= MAX_PROTECTED_PAGES) {
-                            log_line("Too many pages to protect; truncating.");
-                            break;
-                        }
-                        mach_vm_address_t next = region_start + page_size;
-                        if (next > region_end) {
-                            next = region_end;
-                        }
-                        protected_pages[protected_page_count].start = region_start;
-                        protected_pages[protected_page_count].size = next - region_start;
-                        protected_pages[protected_page_count].decrypted = false;
-                        protected_pages[protected_page_count].last_touch_ns = 0;
-                        protected_page_count++;
-                        region_start = next;
-                    }
+                char segname_buf[17];
+                char sectname_buf[17];
+                memcpy(segname_buf, section->segname, sizeof(section->segname));
+                segname_buf[16] = '\0';
+                memcpy(sectname_buf, section->sectname, sizeof(section->sectname));
+                sectname_buf[16] = '\0';
 
-                    return 0;
+                mach_vm_address_t runtime_start = section->addr + image_slide;
+                if (is_text) {
+                    mach_vm_address_t runtime_end = runtime_start + section->size;
+                    if (!code_span.valid) {
+                        code_span.start = runtime_start;
+                        code_span.end = runtime_end;
+                        code_span.init_prot = segment->initprot;
+                        code_span.max_prot = segment->maxprot;
+                        code_span.valid = true;
+                    } else {
+                        if (runtime_start < code_span.start) {
+                            code_span.start = runtime_start;
+                        }
+                        if (runtime_end > code_span.end) {
+                            code_span.end = runtime_end;
+                        }
+                        code_span.init_prot = segment->initprot;
+                        code_span.max_prot = segment->maxprot;
+                    }
+                } else if (is_import) {
+                    if (import_span_count >= MAX_IMPORT_SPANS) {
+                        log_line("Too many import spans; truncating.");
+                    } else {
+                        import_spans[import_span_count].start = runtime_start;
+                        import_spans[import_span_count].size = section->size;
+                        import_spans[import_span_count].init_prot = segment->initprot;
+                        import_spans[import_span_count].max_prot = segment->maxprot;
+                        memcpy(import_spans[import_span_count].segname, segname_buf, sizeof(segname_buf));
+                        memcpy(import_spans[import_span_count].sectname, sectname_buf, sizeof(sectname_buf));
+                        import_span_count++;
+                    }
                 }
             }
         }
         command = (const struct load_command *)((const uint8_t *)command + command->cmdsize);
     }
 
-    log_line("Failed to locate __TEXT,__text section.");
-    return -1;
+    if (code_span.valid) {
+        mach_vm_size_t span_size = (mach_vm_size_t)(code_span.end - code_span.start);
+        if (!register_region("__TEXT", "__protected_code", "text", REGION_KIND_TEXT,
+                             code_span.start, span_size, code_span.init_prot, code_span.max_prot)) {
+            return -1;
+        }
+    }
+
+    for (size_t idx = 0; idx < import_span_count; ++idx) {
+        if (!register_region(import_spans[idx].segname, import_spans[idx].sectname, "import pointers", REGION_KIND_IMPORT,
+                             import_spans[idx].start, import_spans[idx].size,
+                             import_spans[idx].init_prot, import_spans[idx].max_prot)) {
+            return -1;
+        }
+    }
+
+    if (protected_region_count == 0) {
+        log_line("Failed to locate sections to protect.");
+        return -1;
+    }
+
+    return 0;
 }
 
 static void reencrypt_at_exit(void);
@@ -273,11 +463,18 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
 
         pthread_mutex_lock(&page_lock);
         struct ProtectedPage *page = &protected_pages[page_index];
+        const struct ProtectedRegion *region = page->region;
+        if (region == NULL) {
+            pthread_mutex_unlock(&page_lock);
+            log_line("Faulted page missing region metadata.");
+            exit(1);
+        }
+
         if (page->decrypted) {
             page->last_touch_ns = monotonic_ns();
             pthread_mutex_unlock(&page_lock);
-            if (!apply_protection(page_index, text_init_prot)) {
-                log_line("Failed to restore RX protections.");
+            if (!apply_protection(page_index, region->init_prot)) {
+                log_line("Failed to restore initial protections.");
                 exit(1);
             }
             return;
@@ -292,21 +489,20 @@ static void segv_handler(int sig, siginfo_t *info, void *context) {
 #if defined(__APPLE__) && defined(__arm64__)
         pthread_jit_write_protect_np(0);
 #endif
-        printf("Decrypting page at %p\n", (void *)page->start);
+        printf("Decrypting page at %p (%s)\n", (void *)page->start, region->label);
         log_line("Decrypting protected region.");
         xor_page_contents(page_index);
-
 #if defined(__APPLE__) && defined(__arm64__)
         pthread_jit_write_protect_np(1);
 #endif
-        if (!apply_protection(page_index, text_init_prot)) {
+        if (!apply_protection(page_index, region->init_prot)) {
             pthread_mutex_unlock(&page_lock);
-            log_line("Failed to restore RX protections.");
+            log_line("Failed to restore initial protections.");
             exit(1);
         }
 
-        printf("Page decrypted and executable.\n");
-        log_line("Region set to RX.");
+        printf("Page decrypted and accessible.\n");
+        log_line("Region reset to initial protections.");
 
         page->decrypted = true;
         page->last_touch_ns = monotonic_ns();
@@ -396,9 +592,19 @@ static void init_watcher(void) {
 
     log_value("Image slide", image_slide);
 
-    if (locate_text_section() != 0) {
-        log_line("Initialization aborted; could not determine target section.");
+    if (locate_protected_sections() != 0) {
+        log_line("Initialization aborted; could not determine target sections.");
         return;
+    }
+
+    log_value("Protected region count", (uint64_t)protected_region_count);
+    log_value("Protected page count", (uint64_t)protected_page_count);
+
+    for (size_t r = 0; r < protected_region_count; ++r) {
+        if (!prime_region_encryption(&protected_regions[r])) {
+            log_line("Initialization aborted; failed to prime region encryption.");
+            return;
+        }
     }
 
     struct sigaction sa;
@@ -417,7 +623,7 @@ static void init_watcher(void) {
         }
     }
 
-    log_value("Protected pages armed", protected_page_count);
+    log_value("Protected pages armed", (uint64_t)protected_page_count);
 
     monitor_running = true;
     if (pthread_create(&monitor_thread, NULL, page_monitor, NULL) != 0) {

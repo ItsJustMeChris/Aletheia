@@ -16,18 +16,29 @@ LC_SEGMENT_64 = 0x19
 SEGMENT_STRUCT = struct.Struct("<II16sQQQQiiII")
 SECTION_STRUCT = struct.Struct("<16s16sQQIIIIIIII")
 HEADER_STRUCT = struct.Struct("<IiiIIIII")
+SECTION_TYPE_MASK = 0xFF
+S_NON_LAZY_SYMBOL_POINTERS = 0x6
+S_LAZY_SYMBOL_POINTERS = 0x7
 
 
 def xor_encrypt(data: bytes, key: int) -> bytes:
     return bytes(b ^ key for b in data)
 
 
-def find_text_section(binary: bytes) -> tuple[int, int, int]:
+def collect_encryption_targets(binary: bytes) -> list[dict]:
     magic, _, _, _, ncmds, _, _, _ = HEADER_STRUCT.unpack_from(binary, 0)
     if magic != MH_MAGIC_64:
         raise ValueError("Only 64-bit Mach-O binaries are supported.")
 
     offset = HEADER_STRUCT.size
+    targets: list[dict] = []
+    code_section_names = {
+        "__text",
+        "__stubs",
+        "__stub_helper",
+        "__picsymbolstub4",
+    }
+
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", binary, offset)
         if cmd == LC_SEGMENT_64:
@@ -39,34 +50,81 @@ def find_text_section(binary: bytes) -> tuple[int, int, int]:
                 section = SECTION_STRUCT.unpack_from(binary, section_offset)
                 sectname = section[0].split(b"\0", 1)[0].decode("ascii", errors="ignore")
                 sec_segname = section[1].split(b"\0", 1)[0].decode("ascii", errors="ignore")
-                if sec_segname == "__TEXT" and sectname == "__text":
-                    return section[4], section[3], offset
+                size = section[3]
+                if size == 0:
+                    section_offset += SECTION_STRUCT.size
+                    continue
+
+                section_type = section[8] & SECTION_TYPE_MASK
+                reason = None
+                if sec_segname == "__TEXT" and sectname in code_section_names:
+                    reason = "text"
+                elif section_type in (S_NON_LAZY_SYMBOL_POINTERS, S_LAZY_SYMBOL_POINTERS):
+                    reason = "import"
+
+                if reason is not None:
+                    targets.append(
+                        {
+                            "segname": sec_segname,
+                            "sectname": sectname,
+                            "file_offset": section[4],
+                            "size": size,
+                            "segment_offset": offset,
+                            "reason": reason,
+                        }
+                    )
                 section_offset += SECTION_STRUCT.size
         offset += cmdsize
 
-    raise ValueError("Unable to locate __TEXT,__text section in Mach-O binary.")
+    if not targets:
+        raise ValueError("No eligible sections found for encryption.")
+    return targets
 
 
-def encrypt_text_segment(binary_path: Path, output_path: Path, key: int) -> None:
-    data = binary_path.read_bytes()
-    text_offset, text_size, segment_offset = find_text_section(data)
+def encrypt_binary_sections(binary_path: Path, output_path: Path, key: int) -> None:
+    original = binary_path.read_bytes()
+    encrypted = bytearray(original)
 
-    print(f"[encrypt] __text offset=0x{text_offset:x}, size={text_size} bytes, key=0x{key:02x}")
+    targets = collect_encryption_targets(original)
+    segment_offsets = {}
 
-    encrypted = bytearray(data)
-    encrypted[text_offset:text_offset + text_size] = xor_encrypt(
-        data[text_offset:text_offset + text_size], key
-    )
+    for target in targets:
+        start = target["file_offset"]
+        end = start + target["size"]
+        segment_offsets[target["segment_offset"]] = target["segname"]
+        if target["reason"] == "text":
+            encrypted[start:end] = xor_encrypt(original[start:end], key)
+            print(
+                "[encrypt] Section {seg},{sect} offset=0x{off:x}, size={size} bytes, reason={reason}, key=0x{key:02x}".format(
+                    seg=target["segname"],
+                    sect=target["sectname"],
+                    off=start,
+                    size=target["size"],
+                    reason=target["reason"],
+                    key=key,
+                )
+            )
+        else:
+            print(
+                "[encrypt] Skipping on-disk XOR for {seg},{sect} (reason={reason}); runtime watcher will handle it.".format(
+                    seg=target["segname"],
+                    sect=target["sectname"],
+                    reason=target["reason"],
+                )
+            )
 
-    segment = list(SEGMENT_STRUCT.unpack_from(encrypted, segment_offset))
-    maxprot = segment[7]
-    if (maxprot & 0x2) == 0:
-        new_maxprot = maxprot | 0x2
-        segment[7] = new_maxprot
-        SEGMENT_STRUCT.pack_into(encrypted, segment_offset, *segment)
-        print(f"[encrypt] Updated __TEXT maxprot from 0x{maxprot:x} to 0x{new_maxprot:x}")
-    else:
-        print(f"[encrypt] __TEXT maxprot already writable (0x{maxprot:x})")
+    for segment_offset, segname in segment_offsets.items():
+        segment = list(SEGMENT_STRUCT.unpack_from(encrypted, segment_offset))
+        maxprot = segment[7]
+        if (maxprot & 0x2) == 0:
+            new_maxprot = maxprot | 0x2
+            segment[7] = new_maxprot
+            SEGMENT_STRUCT.pack_into(encrypted, segment_offset, *segment)
+            print(
+                f"[encrypt] Updated {segname} maxprot from 0x{maxprot:x} to 0x{new_maxprot:x}"
+            )
+        else:
+            print(f"[encrypt] {segname} maxprot already writable (0x{maxprot:x})")
 
     output_path.write_bytes(encrypted)
     print(f"[encrypt] Wrote encrypted binary to {output_path}")
@@ -100,7 +158,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    encrypt_text_segment(args.input, args.output, args.key)
+    encrypt_binary_sections(args.input, args.output, args.key)
 
 
 if __name__ == "__main__":
