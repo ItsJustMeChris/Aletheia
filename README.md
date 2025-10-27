@@ -76,3 +76,6 @@ To observe the failure mode without the watcher:
 - The encryption routine uses XOR for simplicity; swap in a stronger cipher for realistic protection research.
 - The demo touches low-level system APIs—run it only on systems you control and understand.
 - All code is intended for educational use in exploring runtime code encryption, not for hiding malicious behaviour.
+
+## Example
+![IDA.png](images/ida.png)
