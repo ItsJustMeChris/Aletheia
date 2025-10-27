@@ -5,6 +5,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "import_runtime.h"
+#if __has_include("import_wrappers.h")
+#include "import_wrappers.h"
+#endif
+
 #define PAYLOAD_SIZE 512
 
 #define DEFINE_STAGE(ID, CONST_A, CONST_B)                                                         \

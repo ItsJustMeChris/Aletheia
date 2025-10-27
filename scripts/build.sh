@@ -12,14 +12,21 @@ echo "[build] Project root: ${PROJECT_ROOT}"
 
 mkdir -p "${BUILD_DIR}"
 
-echo "[build] Compiling parent binary..."
+echo "[build] Compiling parent binary (bootstrap pass)..."
 clang "${PROJECT_ROOT}/parent/main.c" -Wl,-segprot,__TEXT,rwx,r-x -o "${BUILD_DIR}/parent_binary"
+
+echo "[build] Generating import manifest..."
+python3 "${PROJECT_ROOT}/scripts/encrypt_binary.py" --manifest-only
+
+echo "[build] Compiling parent binary with runtime imports..."
+clang "${PROJECT_ROOT}/parent/main.c" "${PROJECT_ROOT}/parent/import_runtime.c" \
+  -I "${BUILD_DIR}" -Wl,-segprot,__TEXT,rwx,r-x -o "${BUILD_DIR}/parent_binary"
 
 echo "[build] Encrypting __TEXT,__text segment..."
 python3 "${PROJECT_ROOT}/scripts/encrypt_binary.py"
 
 echo "[build] Building watcher dylib for arch ${ARCH}..."
-clang -dynamiclib -o "${BUILD_DIR}/libwatcher.dylib" "${PROJECT_ROOT}/dylib/watcher.c" -arch "${ARCH}"
+clang -dynamiclib -I "${BUILD_DIR}" -o "${BUILD_DIR}/libwatcher.dylib" "${PROJECT_ROOT}/dylib/watcher.c" -arch "${ARCH}"
 
 if command -v codesign >/dev/null 2>&1; then
   echo "[build] Applying ad-hoc code signatures..."
